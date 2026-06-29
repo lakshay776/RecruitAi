@@ -33,12 +33,31 @@ from services.skill_matcher import match_coverage
 logger = logging.getLogger(__name__)
 
 # ─── Scoring weights ──────────────────────────────────────────────────────────
+# must_have is NOT an additive term — non-negotiables are a *gate*, not a bonus
+# (see _must_have_gate). These four additive weights sum to 1.0 and produce the
+# "base" score, which the gate then scales.
 _WEIGHTS = {
-    "hard_skills":      0.35,
-    "soft_skills":      0.10,
-    "must_have":        0.30,
-    "experience_fit":   0.15,
-    "domain_knowledge": 0.10,
+    "hard_skills":      0.50,
+    "experience_fit":   0.20,
+    "soft_skills":      0.15,
+    "domain_knowledge": 0.15,
+}
+
+# Failing every must-have multiplies the base score by this floor (i.e. a
+# candidate who meets none of the non-negotiables loses half their score).
+# Meeting all of them leaves the score untouched (gate = 1.0).
+_MUST_HAVE_GATE_FLOOR = 0.5
+
+# Stricter cutoff for must-have matching than for general skills — a
+# non-negotiable should only count as met on a confident match.
+_MUST_MATCH_THRESHOLD = 0.68
+
+# Fallback "years required" inferred from the JD's seniority level when the JD
+# states no explicit number, so experience still discriminates.
+_LEVEL_YEARS = {
+    "intern": 0, "entry": 0, "junior": 1,
+    "mid-level": 3, "mid": 3, "intermediate": 3,
+    "senior": 6, "lead": 8, "staff": 8, "principal": 10,
 }
 
 # ─── Prompt templates (LLM judges ONLY soft skills + narrative) ─────────────────
@@ -93,22 +112,43 @@ Now assess soft-skill alignment and write the explanation, gaps, and questions.
 
 # ─── Deterministic sub-scorers ──────────────────────────────────────────────────
 
-def _experience_fit(cv_years, jd_years) -> float:
+def _experience_fit(cv_years, jd_years, jd_level: str = "") -> float:
     """
     Numeric experience match.
 
-    - No requirement stated         → 80 (neutral-positive, can't penalise).
-    - Candidate years unknown       → 50 (uncertain).
-    - Candidate meets/exceeds req    → 100.
-    - Candidate under req            → proportional (e.g. 2/4 yrs → 50).
+    The required years come from the JD's explicit number, or — when it states
+    none — are inferred from the seniority level so experience still
+    discriminates (an "intern" JD and a "senior" JD shouldn't score everyone the
+    same). Only when neither is available do we fall back to a neutral score.
+
+    - Candidate meets/exceeds requirement → 100.
+    - Candidate under requirement         → proportional (e.g. 1/6 yrs → 17).
+    - Requirement unknown, years known     → 65 (mild neutral).
+    - Requirement unknown, years unknown   → 50.
     """
-    if not jd_years or jd_years <= 0:
-        return 80.0
-    if cv_years is None:
-        return 50.0
-    if cv_years >= jd_years:
+    required = jd_years
+    if not required or required <= 0:
+        required = _LEVEL_YEARS.get((jd_level or "").strip().lower())
+
+    if required is None:  # no number AND unrecognised level → can't judge
+        return 65.0 if cv_years else 50.0
+    if required <= 0:  # genuinely an entry-level / intern role
         return 100.0
-    return round(max(0.0, 100.0 * float(cv_years) / float(jd_years)), 1)
+    if cv_years is None:
+        return 40.0  # a real requirement exists but the CV gives no years
+    if cv_years >= required:
+        return 100.0
+    return round(max(0.0, 100.0 * float(cv_years) / float(required)), 1)
+
+
+def _must_have_gate(must_score: float) -> float:
+    """
+    Turn must-have coverage into a multiplicative gate on the final score.
+
+    Non-negotiables aren't worth "bonus points" — failing them should drag the
+    whole score down. Meeting all → 1.0 (no penalty); meeting none → the floor.
+    """
+    return _MUST_HAVE_GATE_FLOOR + (1 - _MUST_HAVE_GATE_FLOOR) * (must_score / 100.0)
 
 
 def _clamp(val, default=0.0) -> float:
@@ -130,16 +170,18 @@ async def score_candidate(cv: ParsedCV, jd: ParsedJD, rank: int = 0) -> Candidat
     logger.info("Scoring candidate '%s' (%s)...", cv.name or cv.filename, cv.candidate_id)
 
     # ── 1. Deterministic dimensions ──────────────────────────────────────────
-    # Candidate "evidence" pools for matching different requirement types.
     cv_domain_pool = (cv.domain_experience or []) + (cv.skills or [])
-    cv_evidence_pool = (cv.skills or []) + (cv.domain_experience or []) + (
-        [cv.education] if cv.education else []
-    )
 
     hard_score, _, missing_hard = match_coverage(jd.hard_skills, cv.skills)
-    must_score, _, missing_must = match_coverage(jd.must_have, cv_evidence_pool)
+    # Must-haves match against SKILLS ONLY (not education/domain prose) and use a
+    # stricter threshold — a non-negotiable shouldn't be satisfied by a vague hit.
+    must_score, _, missing_must = match_coverage(
+        jd.must_have, cv.skills, threshold=_MUST_MATCH_THRESHOLD
+    )
     domain_score, _, _ = match_coverage(jd.domain_knowledge, cv_domain_pool)
-    experience_fit = _experience_fit(cv.experience_years, jd.experience_years)
+    experience_fit = _experience_fit(
+        cv.experience_years, jd.experience_years, jd.experience_level
+    )
 
     # ── 2. LLM judgment: soft skills + narrative ─────────────────────────────
     user_prompt = _USER_PROMPT_TEMPLATE.format(
@@ -187,14 +229,17 @@ async def score_candidate(cv: ParsedCV, jd: ParsedJD, rank: int = 0) -> Candidat
         gaps = (missing_must + missing_hard) or ["Unable to evaluate qualitative fit"]
         interview_questions = []
 
-    # ── 3. Weighted total (deterministic) ────────────────────────────────────
-    total = (
+    # ── 3. Weighted total, then must-have gate (deterministic) ───────────────
+    # Base score from the four additive dimensions...
+    base = (
         hard_score       * _WEIGHTS["hard_skills"] +
         soft_skills      * _WEIGHTS["soft_skills"] +
-        must_score       * _WEIGHTS["must_have"] +
         experience_fit   * _WEIGHTS["experience_fit"] +
         domain_score     * _WEIGHTS["domain_knowledge"]
     )
+    # ...then scale by how many non-negotiables are met. Missing must-haves drag
+    # the whole score down instead of being hidden behind strong other areas.
+    total = base * _must_have_gate(must_score)
 
     breakdown = ScoreBreakdown(
         hard_skills=hard_score,

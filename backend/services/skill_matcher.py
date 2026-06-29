@@ -49,7 +49,12 @@ _SYNONYMS = {
     "ci/cd": "continuous integration continuous deployment",
 }
 
-_MATCH_THRESHOLD = 0.55  # cosine sim (embeddings) above which two items "match"
+# Cosine-similarity cutoff (embeddings) above which two items "match".
+# Known aliases (k8s→kubernetes, etc.) are expanded *before* embedding, so they
+# hit ~1.0 regardless; this threshold only governs genuine semantic neighbours.
+# Tuned upward from 0.55 → 0.62 so loosely-related terms stop counting as a match
+# (which was inflating coverage scores).
+_MATCH_THRESHOLD = 0.62
 
 # Lazily-initialised embedding backend.
 _model = None
