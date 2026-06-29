@@ -80,6 +80,33 @@ async def _create_completion(system_prompt: str, user_prompt: str,
             await asyncio.sleep(delay)
 
 
+def _extract_content(response: Any) -> str:
+    """
+    Safely pull the text content out of a Groq chat completion.
+
+    The Groq/OpenAI API may return ``content == None`` (e.g. when the
+    completion is empty, hit the content filter, or was cut off before any
+    text was produced). Calling ``.strip()`` on that raises an opaque
+    ``AttributeError``; instead we raise a clear, actionable error that names
+    the ``finish_reason`` so callers can surface a useful message.
+    """
+    if not response.choices:
+        raise ValueError("Groq returned no choices in the response.")
+
+    choice = response.choices[0]
+    content = choice.message.content
+
+    if content is None:
+        finish_reason = getattr(choice, "finish_reason", "unknown")
+        logger.error("Groq returned empty content (finish_reason=%s)", finish_reason)
+        raise ValueError(
+            f"Groq returned no content (finish_reason={finish_reason}). "
+            "The completion may have been blocked or truncated."
+        )
+
+    return content.strip()
+
+
 async def chat_json(
     system_prompt: str,
     user_prompt: str,
@@ -94,7 +121,7 @@ async def chat_json(
     """
     response = await _create_completion(system_prompt, user_prompt, temperature, max_tokens)
 
-    raw = response.choices[0].message.content.strip()
+    raw = _extract_content(response)
     logger.debug("Groq raw response: %s", raw[:300])
 
     # Strip markdown code fences if the model wraps the JSON
@@ -119,4 +146,4 @@ async def chat_text(
     """Send a chat completion request and return the raw text response."""
     response = await _create_completion(system_prompt, user_prompt, temperature, max_tokens)
 
-    return response.choices[0].message.content.strip()
+    return _extract_content(response)
